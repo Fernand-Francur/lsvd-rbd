@@ -10,6 +10,7 @@
 #include <libaio.h>
 #include <unistd.h>
 #include <sys/uio.h>
+#include <uuid/uuid.h>
 
 #include <mutex>
 #include <shared_mutex>
@@ -22,7 +23,6 @@
 #include "misc_cache.h"
 #include "backend.h"
 #include "io.h"
-#include "translate.h"
 #include "request.h"
 
 #include "nvme.h"

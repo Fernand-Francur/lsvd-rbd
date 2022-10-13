@@ -15,8 +15,9 @@
  */
 class write_cache {
 public:
-    virtual void get_room(int blks) = 0; 
-    virtual void release_room(int blks) = 0;
+    virtual void get_room(sector_t sectors) = 0; 
+    virtual void release_room(sector_t sectors) = 0;
+    virtual void flush(void) = 0;
 
     virtual ~write_cache() {}
 
@@ -33,7 +34,7 @@ public:
 };
 
 extern write_cache *make_write_cache(uint32_t blkno, int fd,
-                                     translate *be, int n_threads);
+                                     translate *be, lsvd_config *cfg);
 
 #endif
 

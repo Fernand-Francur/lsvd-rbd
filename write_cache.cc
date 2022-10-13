@@ -36,7 +36,7 @@
 #include "nvme.h"
 
 #include "write_cache.h"
-extern uuid_t my_uuid;
+#include "config.h"
 
 typedef std::tuple<request*,sector_t,smartiov*> work_tuple;
 
@@ -44,13 +44,16 @@ typedef std::tuple<request*,sector_t,smartiov*> work_tuple;
 class write_cache_impl : public write_cache {
     size_t         dev_max;
     uint32_t       super_blkno;
-
-    std::atomic<int64_t> sequence; // write sequence #
+    lsvd_config   *cfg;
+    
+    std::atomic<uint64_t> sequence; // write sequence #
 
     /* bookkeeping for write throttle
      */
     int total_write_pages = 0;
     int max_write_pages = 0;
+    int outstanding_writes = 0;
+    size_t write_batch = 0;
     std::condition_variable write_cv;
 
     void evict(page_t base, page_t len);
@@ -59,7 +62,7 @@ class write_cache_impl : public write_cache {
     /* initialization stuff
      */
     void read_map_entries();
-    void roll_log_forward();
+    int roll_log_forward();
 
     /* track length of each journal record in cache
      */
@@ -67,6 +70,7 @@ class write_cache_impl : public write_cache {
 
     thread_pool<int>          *misc_threads;
 
+    void flush_thread(thread_pool<int> *p);
     void ckpt_thread(thread_pool<int> *p);
     bool ckpt_in_progress = false;
     void write_checkpoint(void);
@@ -85,18 +89,19 @@ class write_cache_impl : public write_cache {
     extmap::cachemap2 rmap;
     bool              map_dirty;
     translate        *be;
-    j_hdr *mk_header(char *buf, uint32_t type, uuid_t &uuid, page_t blks);
+    j_hdr *mk_header(char *buf, uint32_t type, page_t blks);
     nvme 		      *nvme_w = NULL;
 
 public:
 
     /* throttle writes with window of max_write_pages
      */
-    void get_room(int blks); 
-    void release_room(int blks);
+    void get_room(sector_t sectors); 
+    void release_room(sector_t sectors);
+    void flush(void);
 
-
-    write_cache_impl(uint32_t blkno, int _fd, translate *_be, int n_threads);
+    write_cache_impl(uint32_t blkno, int _fd, translate *_be,
+		     lsvd_config *cfg);
     ~write_cache_impl();
 
     void writev(request *req, sector_t lba, smartiov *iov);
@@ -149,7 +154,6 @@ public:
     void release() {}		// TODO: free properly
 };
 
-
 /* n_pages: number of 4KB data pages (not counting header)
  * page:    page number to begin writing 
  * n_pad:   number of pages to skip (not counting header)
@@ -164,7 +168,7 @@ wcache_write_req::wcache_write_req(std::vector<work_tuple> *work_,
     
     if (pad != 0) {
 	pad_hdr = (char*)aligned_alloc(512, 4096);
-	wcache->mk_header(pad_hdr, LSVD_J_PAD, my_uuid, n_pad+1);
+	wcache->mk_header(pad_hdr, LSVD_J_PAD, n_pad+1);
 	pad_iov = new smartiov();
 	pad_iov->push_back((iovec){pad_hdr, 4096});
 	reqs++;
@@ -178,7 +182,7 @@ wcache_write_req::wcache_write_req(std::vector<work_tuple> *work_,
     }
   
     hdr = (char*)aligned_alloc(512, 4096);
-    j_hdr *j = wcache->mk_header(hdr, LSVD_J_DATA, my_uuid, 1+n_pages);
+    j_hdr *j = wcache->mk_header(hdr, LSVD_J_DATA, 1+n_pages);
 
     j->extent_offset = sizeof(*j);
     size_t e_bytes = extents.size() * sizeof(j_extent);
@@ -193,6 +197,7 @@ wcache_write_req::wcache_write_req(std::vector<work_tuple> *work_,
 	auto [iov, iovcnt] = iovs->c_iov();
 	data_iovs->ingest(iov, iovcnt);
     }
+    reqs++;
     r_data = wcache->nvme_w->make_write_request(data_iovs, page*4096L);
 }
 
@@ -231,6 +236,10 @@ void wcache_write_req::notify(request *child) {
 	 */
 	for (auto it = garbage.begin(); it != garbage.end(); it++) 
 	    wcache->rmap.trim(it->s.base, it->s.base+it->s.len);
+
+	wcache->outstanding_writes--;
+	if (wcache->work.size() >= wcache->write_batch)
+	    wcache->send_writes(lk);
     }
 
     /* send data to backend, invoke callbacks, then clean up
@@ -247,11 +256,8 @@ void wcache_write_req::notify(request *child) {
 }
 
 void wcache_write_req::run(request *parent /* unused */) {
-    reqs++;
-    if(r_pad) {
-	reqs++;
+    if(r_pad) 
 	r_pad->run(this);
-    }
     r_data->run(this);
 }
 
@@ -260,20 +266,26 @@ void wcache_write_req::run(request *parent /* unused */) {
 /* stall write requests using window of max_write_blocks, which should
  * be <= 0.5 * write cache size.
  */
-void write_cache_impl::get_room(int pages) {
+void write_cache_impl::get_room(sector_t sectors) {
+    int pages = sectors / 8;
     std::unique_lock lk(m);
     while (total_write_pages + pages > max_write_pages)
 	write_cv.wait(lk);
     total_write_pages += pages;
-    if (total_write_pages < max_write_pages)
-	write_cv.notify_one();
 }
 
-void write_cache_impl::release_room(int pages) {
+void write_cache_impl::release_room(sector_t sectors) {
+    int pages = sectors / 8;
     std::unique_lock lk(m);
     total_write_pages -= pages;
     if (total_write_pages < max_write_pages)
-	write_cv.notify_one();
+	write_cv.notify_all();
+}
+
+void write_cache_impl::flush(void) {
+    std::unique_lock lk(m);
+    while (total_write_pages > 0)
+	write_cv.wait(lk);
 }
 
 /* circular buffer logic - returns true if any [p..p+len) is in the
@@ -349,18 +361,31 @@ uint32_t write_cache_impl::allocate(page_t n, page_t &pad, page_t &n_pad) {
 
 /* call with lock held
  */
-j_hdr *write_cache_impl::mk_header(char *buf, uint32_t type, uuid_t &uuid, page_t blks) {
+j_hdr *write_cache_impl::mk_header(char *buf, uint32_t type, page_t blks) {
     assert(!m.try_lock());
     memset(buf, 0, 4096);
     j_hdr *h = (j_hdr*)buf;
-    *h = (j_hdr){.magic = LSVD_MAGIC, .type = type, .version = 1, .vol_uuid = {0},
+    *h = (j_hdr){.magic = LSVD_MAGIC, .type = type, .version = 1,
 		 .seq = super->seq++, .len = (uint32_t)blks, .crc32 = 0,
 		 .extent_offset = 0, .extent_len = 0};
-    memcpy(h->vol_uuid, uuid, sizeof(uuid));
     return h;
 }
 
+void write_cache_impl::flush_thread(thread_pool<int> *p) {
+    pthread_setname_np(pthread_self(), "wcache_flush");
+    auto period = std::chrono::milliseconds(50);
+    while (p->running) {
+	std::unique_lock lk(m);
+	p->cv.wait_for(lk, period);
+	if (!p->running)
+	    return;
+	if (outstanding_writes == 0 && work.size() > 0)
+	    send_writes(lk);
+    }
+}
+
 void write_cache_impl::ckpt_thread(thread_pool<int> *p) {
+    pthread_setname_np(pthread_self(), "wcache_ckpt");
     auto next0 = super->next, N = super->limit - super->base;
     auto period = std::chrono::milliseconds(100);
     auto t0 = std::chrono::system_clock::now();
@@ -492,16 +517,75 @@ void write_cache_impl::read_map_entries() {
     free(len_buf);
 }
 
-void write_cache_impl::roll_log_forward() {
-    // TODO TODO TODO
-}
-    
-write_cache_impl::write_cache_impl(uint32_t blkno, int fd,
-				   translate *_be, int n_threads) {
+int write_cache_impl::roll_log_forward() {
+    // TODO
+    // start at write_super->next
+    // for each journal record:
+    //   read the whole record
+    //   verify it, quit if done
+    //   for each entry in it
+    //     put it in the map and rmap
+    //     send it to the backend
+    // if we moved write_super->next, write another checkpoint
+    bool dirty = false;
+    while (true) {
+	char buf[4096];
+	auto hdr = (j_hdr*)buf;
+	if (nvme_w->read(buf, sizeof(buf), 4096L * super->next) < 0)
+	    return -1;
+	if (hdr->magic != LSVD_MAGIC ||
+	    (hdr->type != LSVD_J_DATA && hdr->type != LSVD_J_PAD) ||
+	    hdr->seq != sequence.load())
+	    break;
 
+	sequence++;
+	if (hdr->type == LSVD_J_PAD) {
+	    super->next = super->base;
+	    continue;
+	}
+	
+	lengths[super->next] = hdr->len;
+	dirty = true;
+	std::vector<j_extent> entries;
+	decode_offset_len<j_extent>(buf, hdr->extent_offset,
+				    hdr->extent_len, entries);
+
+	size_t data_len = 4096L * (hdr->len - 1);
+	char *data = (char*)aligned_alloc(512, data_len);
+	if (nvme_w->read(data, data_len, 4096L * (super->next + 1)) < 0)
+	    return -1;
+
+	sector_t plba = (super->next+1) * 8;
+	size_t offset = 0;
+	std::vector<extmap::lba2lba> garbage;
+	for (auto e : entries) {
+	    map.update(e.lba, e.lba+e.len, plba, &garbage);
+	    rmap.update(plba, plba+e.len, e.lba);
+	    size_t bytes = e.len * 512;
+	    iovec iov = {data+offset, bytes};
+	    be->writev(e.lba*512, &iov, 1);
+	    offset += bytes;
+	    plba += e.len;
+	}
+	for (auto g : garbage)
+	    rmap.trim(g.s.base, g.s.base+g.s.len);
+	
+	free(data);
+	super->next += hdr->len;
+	
+    }
+    if (dirty)
+	write_checkpoint();
+
+    return 0;
+}
+
+write_cache_impl::write_cache_impl( uint32_t blkno, int fd, translate *_be,
+				    lsvd_config *cfg_) {
     super_blkno = blkno;
     dev_max = getsize64(fd);
     be = _be;
+    cfg = cfg_;
     
     const char *name = "write_cache_cb";
     nvme_w = make_nvme(fd, name);
@@ -520,16 +604,20 @@ write_cache_impl::write_cache_impl(uint32_t blkno, int fd,
 
     auto N = super->limit - super->base;
     max_write_pages = N/2;
+    write_batch = cfg->wcache_batch;
     
     // https://stackoverflow.com/questions/22657770/using-c-11-multithreading-on-non-static-member-function
 
     misc_threads = new thread_pool<int>(&m);
-    misc_threads->pool.push(std::thread(&write_cache_impl::ckpt_thread, this, misc_threads));
+    misc_threads->pool.push(std::thread(&write_cache_impl::ckpt_thread,
+					this, misc_threads));
+    misc_threads->pool.push(std::thread(&write_cache_impl::flush_thread,
+					this, misc_threads));
 }
 
 write_cache *make_write_cache(uint32_t blkno, int fd,
-			      translate *be, int n_threads) {
-    return new write_cache_impl(blkno, fd, be, n_threads);
+			      translate *be, lsvd_config *cfg) {
+    return new write_cache_impl(blkno, fd, be, cfg);
 }
 
 write_cache_impl::~write_cache_impl() {
@@ -565,7 +653,8 @@ void write_cache_impl::send_writes(std::unique_lock<std::mutex> &lk) {
     }
 
     auto req = new wcache_write_req(w, pages, page, n_pad-1, pad, this);
-
+    outstanding_writes++;
+    
     lk.unlock();
     req->run(NULL);
 }
@@ -576,7 +665,7 @@ void write_cache_impl::writev(request *req, sector_t lba, smartiov *iov) {
 
     // if we're not under write pressure, send writes immediately; else
     // batch them
-    if (total_write_pages < 32 || work.size() >= 8) 
+    if (outstanding_writes == 0 || work.size() >= write_batch)
 	send_writes(lk);
 }
 

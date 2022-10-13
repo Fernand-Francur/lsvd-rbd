@@ -11,7 +11,8 @@ import mkdisk
 import signal
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-nvme = '/tmp/nvme'
+os.environ["LSVD_BACKEND"] = "file"
+nvme = '/tmp/obj.cache'
 img = '/tmp/bkt/obj'
 dir = os.path.dirname(img)
 
@@ -29,9 +30,9 @@ def rbd_startup():
     mkdisk.cleanup(img)
     sectors = 10*1024*2 # 10MB
     mkdisk.mkdisk(img, sectors)
+    mkcache.cleanup(nvme)
     mkcache.mkcache(nvme)
-    name = nvme + ',' + img
-    return lsvd.rbd_open(name)
+    return lsvd.rbd_open(img)
 
 def rbd_finish(_img):
     lsvd.rbd_close(_img)

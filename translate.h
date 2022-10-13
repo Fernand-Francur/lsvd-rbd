@@ -13,10 +13,12 @@
 
 struct iovec;
 class backend;
-class objmap;
+class lsvd_config;
 
 class translate {
 public:
+    uuid_t    uuid;
+
     translate() {}
     virtual ~translate() {}
 
@@ -27,6 +29,7 @@ public:
     virtual int checkpoint(void) = 0; /* flush, then write checkpoint */
 
     virtual ssize_t writev(size_t offset, iovec *iov, int iovcnt) = 0;
+    virtual void wait_for_room(void) = 0;
     virtual ssize_t readv(size_t offset, iovec *iov, int iovcnt) = 0;
 
     virtual const char *prefix() = 0; /* for read cache */
@@ -40,6 +43,7 @@ public:
     virtual int frontier(void) = 0;
 };
 
-extern translate *make_translate(backend *_io, objmap *omap);
+extern translate *make_translate(backend *_io, lsvd_config *cfg,
+                                 extmap::objmap *map, std::shared_mutex *m);
 
 #endif

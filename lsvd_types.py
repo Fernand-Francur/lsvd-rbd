@@ -135,7 +135,6 @@ class j_hdr(Structure):
     _fields_ = [("magic",         c_uint),
                 ("type",          c_uint),
                 ("version",       c_uint),
-                ("vol_uuid",      c_ubyte*16),
                 ("seq",           c_ulong),
                 ("len",           c_uint),
                 ("crc32",         c_uint),
@@ -147,7 +146,6 @@ class j_write_super(Structure):
     _fields_ = [("magic",       c_uint),
                 ("type",        c_uint),
                 ("version",     c_uint),
-                ("vol_uuid",    c_ubyte*16),
                 ("seq",         c_ulong),
                 ("meta_base",   c_uint),
                 ("meta_limit",  c_uint),
@@ -164,10 +162,10 @@ class j_write_super(Structure):
 sizeof_j_write_super = sizeof(j_write_super)
 
 class j_read_super(Structure):
+    _pack_ = 1
     _fields_ = [("magic",        c_uint),
                 ("type",         c_uint),
                 ("version",      c_uint),
-                ("vol_uuid",     c_ubyte*16),
                 ("unit_size",    c_int),
                 ("base",         c_int),
                 ("units",        c_int),
@@ -179,6 +177,7 @@ class j_read_super(Structure):
 sizeof_j_read_super = sizeof(j_read_super)
 
 class j_super(Structure):
+    _pack_ = 1
     _fields_ = [("magic",        c_uint),
                 ("type",         c_uint),
                 ("version",      c_uint),

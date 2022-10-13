@@ -73,11 +73,15 @@ rados_backend::rados_backend() {
 }
 
 rados_backend::~rados_backend() {
+    if (pool_len > 0)
+	rados_ioctx_destroy(io_ctx);
     /* TODO: do we close things down? */
 }
 
-/* TODO: make rados_backend take an io_ctx, dispense with all this
- * pool nonsense. Means all images go in the same pool
+/* if pool hasn't been initialized yet, initialize the ioctx
+ * only supports one pool, exception if you try to access another one
+ * name format: <pool>/<object_prefix>
+ * HACK: returns pointer to object name
  */
 char* rados_backend::pool_init(const char *pool_) {
     if (pool_len == 0) {
@@ -95,17 +99,9 @@ char* rados_backend::pool_init(const char *pool_) {
     return (char*)pool_ + pool_len + 1;
 }
 
-/* really gross, just special case of strtok. 
- */
-std::pair<char*,char*> split_name(char *name) {
-    char *p = strchr(name, '/');
-    *p = 0;
-    return std::pair(name, p+1);
-}
-
 int rados_backend::write_object(const char *name, iovec *iov, int iovcnt) {
     auto oname = pool_init(name);
-
+    assert(*((int*)iov[0].iov_base) == LSVD_MAGIC);
     smartiov iovs(iov, iovcnt);
     char *buf = (char*)malloc(iovs.bytes());
     iovs.copy_out(buf);
@@ -163,6 +159,7 @@ public:
 	parent->notify(this);
 	if (buf != NULL)
 	    free(buf);
+	rados_aio_release(c);
 	delete this;
     }
 
@@ -198,6 +195,7 @@ public:
 request *rados_backend::make_write_req(const char *name, iovec *iov,
 				       int iovcnt) {
     auto oid = pool_init(name);
+    assert(*((int*)iov[0].iov_base) == LSVD_MAGIC);
     return new rados_be_request(OP_WRITE, oid, iov, iovcnt, 0, io_ctx);
 }
 
