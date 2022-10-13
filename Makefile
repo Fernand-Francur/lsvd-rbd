@@ -23,6 +23,9 @@ test-1: test-1.o $(OBJS)
 test-2: test-2.o $(OBJS)
 	$(CXX) -o $@ test-2.o $(OBJS) -lstdc++fs -lpthread -lrados -lrt -laio
 
+stressTest: stressTest.o $(OBJS)
+	$(CXX) -o $@ stressTest.o $(OBJS) -lstdc++fs -lpthread -lrados -lrt -laio
+
 # Add .d to Make's recognized suffixes.
 SUFFIXES += .d
 
