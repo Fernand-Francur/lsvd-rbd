@@ -24,7 +24,7 @@ test-2: test-2.o $(OBJS)
 	$(CXX) -o $@ test-2.o $(OBJS) -lstdc++fs -lpthread -lrados -lrt -laio -luuid
 
 stressTest: stressTest.o $(OBJS)
-	$(CXX) -o $@ stressTest.o $(OBJS) -lstdc++fs -lpthread -lrados -lrt -laio
+	$(CXX) -o $@ stressTest.o $(OBJS) -lstdc++fs -lpthread -lrados -lrt -laio -luuid
 
 # Add .d to Make's recognized suffixes.
 SUFFIXES += .d
